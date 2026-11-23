@@ -24,26 +24,30 @@ class BatchReplayService(BaseModuleService):
     # ---- 业务扩展：批量回放和断点续传 ----
 
     def start_replay(self, entry_id: int) -> dict[str, Any]:
-        """启动回放任务：从载荷存储读取原始消息并按速率写入目标Topic。"""
+        """启动回放任务：从载荷存储读取原始消息并按速率写入目标Topic。
+
+        只按批次读取已准备完整的载荷行，与有效入库回执保持一致；挂起中、未采纳的行
+        不会进入回放。回放产生的副本同样走载荷存储共用流程，行号在锁内分配。
+        """
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
             return {"ok": False, "message": "回放任务不存在"}
         target = entry.get("目标Topic", "")
-        payloads = store.rows("payload_store")
-        matched = [p for p in payloads if target in str(p.get("采集批次", ""))]
+        from app.services import service_for
+        payload_service = service_for("payload_store")
+        # 与有效入库回执一致：仅取准备完整的行。
+        matched = payload_service.get_replay_source(target, limit=10)
         entry["status"] = "回放中"
         entry["pending"] = True
-        now = datetime.now(timezone.utc).isoformat()
         replayed = 0
-        for p in matched[:10]:
+        for p in matched:
             p_id = p.get("消息ID", f"replay-{replayed}")
-            store.rows("payload_store").append({
-                "id": max((int(r.get("id", 0)) for r in store.rows("payload_store")), default=0) + 1,
-                "采集批次": f"replay-{target}", "消息ID": f"replayed-{p_id}",
-                "原始载荷": str(p.get("原始载荷", "")), "存储时间": now,
-                "压缩后大小": str(len(str(p.get("原始载荷", "")))), "status": "已存储",
-                "pending": True, "abnormal": False,
-            })
+            raw_text = str(p.get("原始载荷", ""))
+            payload_service.write_raw_payload(
+                batch_name=f"replay-{target}",
+                message_id=lambda pid, p_id=p_id: f"replayed-{p_id}",
+                raw_text=raw_text, ready=True, source="batch_replay",
+            )
             replayed += 1
         return {"ok": True, "message": f"回放已启动，已回放{replayed}条", "replayed": replayed}
 
@@ -60,7 +64,11 @@ class BatchReplayService(BaseModuleService):
             return {"ok": False, "message": "开始时间不能晚于结束时间"}
         payloads = store.rows("payload_store")
         target = entry.get("目标Topic", "")
-        in_range = [p for p in payloads if target in str(p.get("采集批次", ""))]
+        in_range = [
+            p for p in payloads
+            if target in str(p.get("采集批次", ""))
+            and p.get("准备状态", "完整") == "完整"
+        ]
         return {"ok": True, "in_range_count": len(in_range), "range": f"{start_str}~{end_str}"}
 
     def handle_interrupt(self, entry_id: int, reason: str) -> dict[str, Any]:

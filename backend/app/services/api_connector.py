@@ -42,25 +42,46 @@ class ApiConnectorService(BaseModuleService):
             entry["status"] = "连通失败"
             return {"ok": False, "message": f"连通失败: {exc}"}
 
-    def produce_to_queue(self, entry_id: int, payload: dict[str, Any]) -> dict[str, Any]:
-        """将API响应写入统一消息队列，形成接入→队列的完整链路。"""
+    def produce_to_queue(self, entry_id: int, payload: dict[str, Any],
+                         commit_no: str | None = None) -> dict[str, Any]:
+        """将API响应写入统一消息队列，形成接入→队列的完整链路。
+
+        原始载荷明细经由载荷存储的共用流程写入，行号由共用流程在锁内分配，避免与数据
+        落地入口并发时回执指向同一个号；本入口仍自行生成 Topic（批次名）、消息 ID 和
+        原样文本。带提交编号时走原子核对，同编号后续不同金额不能改动已交付的原文。
+        """
         entry = store.find(self.MODULE, entry_id)
         if entry is None or entry.get("status") != "已连通":
             return {"ok": False, "message": "连接器不可用或未连通"}
         topic = f"api-{entry.get('连接器名称', 'unnamed')}-{entry_id}"
-        message_id = f"api-msg-{entry_id}-{datetime.now(timezone.utc).timestamp():.0f}"
-        store.rows("payload_store").append({
-            "id": max((int(r.get("id", 0)) for r in store.rows("payload_store")), default=0) + 1,
-            "采集批次": topic,
-            "消息ID": message_id,
-            "原始载荷": str(payload),
-            "存储时间": datetime.now(timezone.utc).isoformat(),
-            "压缩后大小": str(len(str(payload))),
-            "status": "已存储",
-            "pending": True,
-            "abnormal": False,
-        })
-        return {"ok": True, "message": "消息已入队", "topic": topic, "message_id": message_id}
+        raw_text = str(payload)
+        message_id_fn = lambda pid: f"api-msg-{entry_id}-{datetime.now(timezone.utc).timestamp():.0f}"
+        from app.services import service_for
+        payload_service = service_for("payload_store")
+        if commit_no:
+            outcome = payload_service.submit_payload(
+                entry="api_connector", commit_no=commit_no, batch_name=topic,
+                message_id=message_id_fn, raw_text=raw_text,
+                source=f"api_connector:{entry_id}",
+            )
+            if not outcome.get("ok"):
+                return {"ok": False, "message": outcome["reason"],
+                        "conflict": True, "topic": topic,
+                        "receipt": outcome.get("receipt")}
+            receipt = outcome["receipt"]
+            result = {"ok": True, "message": "消息已入队", "topic": topic,
+                      "message_id": receipt["消息ID"], "payload_id": receipt["payload_id"],
+                      "commit_no": commit_no}
+            if outcome.get("duplicate"):
+                result["duplicate"] = True
+                result["message"] = outcome["reason"]
+            return result
+        written = payload_service.write_raw_payload(
+            batch_name=topic, message_id=message_id_fn, raw_text=raw_text,
+            ready=True, source=f"api_connector:{entry_id}",
+        )
+        return {"ok": True, "message": "消息已入队", "topic": topic,
+                "message_id": written["消息ID"], "payload_id": written["payload_id"]}
 
     def validate_request(self, entry_id: int, method: str, params: dict[str, Any]) -> list[str]:
         """校验API请求参数：必填字段、认证凭据、方法合法性、频率上限。"""
